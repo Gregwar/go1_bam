@@ -2,6 +2,7 @@ import numpy as np
 from .parameter import Parameter
 from .testbench import Testbench, Pendulum
 from . import message
+from typing import Union
 
 
 class Actuator:
@@ -33,7 +34,7 @@ class Actuator:
 
     def compute_control(
         self, position_error: float, q: float, dq: float
-    ) -> float | None:
+    ) -> Union[float, None]:
         """
         The control (e.g volts or amps) produced by the actuator, given the position error and current configruation
         """
@@ -98,7 +99,7 @@ class Erob(Actuator):
 
     def compute_control(
         self, position_error: float, q: float, dq: float
-    ) -> float | None:
+    ) -> Union[float, None]:
         # Target velocity is assumed to be 0
         amps = position_error * self.kp + self.damping * np.sqrt(self.kp) * (0.0 - dq)
         amps = np.clip(amps, -self.max_amps, self.max_amps)
@@ -124,6 +125,59 @@ class Erob(Actuator):
         torque = np.clip(torque, min_torque, max_torque)
 
         return torque
+
+    def get_extra_inertia(self) -> float:
+        return self.model.armature.value
+
+
+class UnitreeGo1(Actuator):
+    def __init__(self, testbench_class: Testbench, damping=0.3):
+        super().__init__(testbench_class)
+
+        # Damping factor
+        self.damping = damping
+
+    def initialize(self):
+        # Torque multiplier
+        self.model.ratio = Parameter(1.0, 0.5, 2.0)
+
+        # Maximum torque [N.m]
+        self.model.max_torque = Parameter(23.7, 20, 30)
+
+        # Motor armature / apparent inertia [kg m^2]
+        self.model.armature = Parameter(0.005, 0.00001, 2.0)
+
+        # Adjusting upper bounds for identification
+        self.model.max_friction_base = 5.0
+        self.model.max_load_friction = 2.0
+        self.model.max_viscous_friction = 1.0
+
+    def load_log(self, log: dict):
+        super().load_log(log)
+
+        self.kp = log["kp"]
+
+        if "damping" in log:
+            self.damping = log["damping"]
+
+    def control_unit(self) -> str:
+        return "N.m"
+
+    def compute_control(
+        self, position_error: float, q: float, dq: float
+    ) -> Union[float, None]:
+        # Target velocity is assumed to be 0
+        torque = position_error * self.kp + self.damping * (0.0 - dq)
+        torque = np.clip(torque, -self.model.max_torque.value, self.model.max_torque.value)
+
+        return torque
+
+    def compute_torque(
+        self, control: float | None, torque_enable: bool, q: float, dq: float
+    ) -> float:
+        torques = control * torque_enable
+
+        return torques * self.model.ratio.value
 
     def get_extra_inertia(self) -> float:
         return self.model.armature.value
@@ -174,7 +228,7 @@ class MXActuator(Actuator):
 
     def compute_control(
         self, position_error: float, q: float, dq: float
-    ) -> float | None:
+    ) -> Union[float, None]:
         duty_cycle = position_error * self.kp * self.error_gain
         duty_cycle = np.clip(duty_cycle, -self.max_pwm, self.max_pwm)
 
@@ -192,6 +246,105 @@ class MXActuator(Actuator):
         torque -= (self.model.kt.value**2) * dq / self.model.R.value
 
         return torque * torque_enable
+
+
+class XC330M288T(MXActuator):
+    """
+    XC330M288T
+    """
+
+    def __init__(self, testbench_class: Testbench):
+        super().__init__(testbench_class)
+
+        # Input voltage and (firmware) gain
+        self.vin: float = 5.1
+        self.kp: float = 1100.0
+
+        # This gain, if multiplied by a position error and firmware KP, gives duty cycle
+        # It was determined using an oscilloscope and XC actuators
+        self.error_gain = 0.002877778
+
+        # Maximum allowable duty cycle, also determined with oscilloscope
+        self.max_pwm = 1.0
+
+    def load_log(self, log: dict):
+        super().load_log(log)
+
+        self.kp = log["kp"]
+
+        if "vin" in log:
+            self.vin = log["vin"]
+
+    def initialize(self):
+        # Torque constant [Nm/A] or [V/(rad/s)]
+        self.model.kt = Parameter(1.6, 0.1, 3.0)
+
+        # Motor resistance [Ohm]
+        self.model.R = Parameter(2.0, 1.0, 8.0)
+
+        # Motor armature / apparent inertia [kg m^2]
+        self.model.armature = Parameter(0.001, 0.0001, 0.01)
+
+        # self.model.max_friction_base = 10.0
+        # self.model.max_load_friction = 1.0
+        # self.model.max_viscous_friction = 30.0
+
+
+class STS3215(MXActuator):
+    """
+    Feetech STS3215 7.4v
+    """
+
+    def __init__(self, testbench_class: Testbench):
+        super().__init__(testbench_class)
+
+        # Input voltage and (firmware) gain
+        self.vin: float = 7.4
+        self.kp: float = 32
+
+        # This gain, if multiplied by a position error and firmware KP, gives duty cycle
+        # It was determined using an oscilloscope and STS3215 actuators
+        # here, firmware_kp = kp
+        self.error_gain = 0.166
+        # self.error_gain = 0.001 * np.rad2deg(1.0)
+
+        # Maximum allowable duty cycle, also determined with oscilloscope
+        self.max_pwm = 0.97  # TODO, but can we assume 1.0 ?
+
+    def load_log(self, log: dict):
+        super().load_log(log)
+
+        self.kp = log["kp"]
+
+        if "vin" in log:
+            self.vin = log["vin"]
+
+    def initialize(self):
+        # Torque constant [Nm/A] or [V/(rad/s)]
+        self.model.kt = Parameter(0.784532, 0.05, 2.5)  # docs says 8 kg.cm / A
+        # self.model.kt = Parameter(0.784532, 0.784531, 0.784533)  # docs says 8 kg.cm / A
+
+        # Motor resistance [Ohm]
+        self.model.R = Parameter(2.0, 0.1, 10.0)
+        # self.model.R = Parameter(3, 2.9, 3.1)
+        # self.model.R = 2.5 # docs says 2.5 ohm, Greg says 1.5
+
+        # Motor armature / apparent inertia [kg m^2]
+        self.model.armature = Parameter(0.0001, 0.00001, 0.04)
+
+        self.model.q_offset = Parameter(0, -0.2, 0.2)
+
+        # self.model.max_friction_base = 10.0
+        # self.model.max_load_friction = 1.0
+        # self.model.max_viscous_friction = 30.0
+
+    def compute_control(
+        self, position_error: float, q: float, dq: float
+    ) -> Union[float, None]:
+        duty_cycle = position_error * self.kp * self.error_gain
+        duty_cycle = np.clip(duty_cycle, -self.max_pwm, self.max_pwm)
+
+        return self.vin * duty_cycle
 
 
 class LinearActuator(Actuator):
@@ -232,13 +385,13 @@ class LinearActuator(Actuator):
 
     def compute_control(
         self, position_error: float, q: float, dq: float
-    ) -> float | None:
+    ) -> Union[float, None]:
         duty_cycle = position_error * self.kp
         duty_cycle = np.clip(duty_cycle, -1.0, 1.0)
 
         return self.vin * duty_cycle
 
-    def compute_torque(self, control: float | None, q: float, dq: float) -> float:
+    def compute_torque(self, control: Union[float, None], q: float, dq: float) -> float:
         # Volts to None means that the motor is disconnected
         if control is None:
             return 0.0
@@ -257,6 +410,9 @@ class LinearActuator(Actuator):
 actuators = {
     "mx64": lambda: MXActuator(Pendulum),
     "mx106": lambda: MXActuator(Pendulum),
+    "unitree_go1": lambda: UnitreeGo1(Pendulum, damping=0.3),
     "erob80_100": lambda: Erob(Pendulum, damping=2.0),
     "erob80_50": lambda: Erob(Pendulum, damping=1.0),
+    "xc330m288t": lambda: XC330M288T(Pendulum),
+    "sts3215": lambda: STS3215(Pendulum),
 }
